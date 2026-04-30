@@ -12,7 +12,7 @@ from telethon.sessions import StringSession
 import motor.motor_asyncio
 import dns.resolver
 import traceback
-
+import certifi
 
 dns.resolver.default_resolver = dns.resolver.Resolver(configure=False)
 dns.resolver.default_resolver.nameservers = ['8.8.8.8', '8.8.4.4']
@@ -26,21 +26,24 @@ console_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
 
 # --- CONFIGURATION ---
-# --- CONFIGURATION ---
 API_ID = int(os.environ.get("API_ID", 3567))
 API_HASH = os.environ.get("API_HASH", "a8ab964cb6c88")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "7908931052:AAFdpDkr")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "7908931052:AAFdpDkrcHPP2qm3vVEYwIeb_KQs2qyXkk4")
 OXAPAY_KEY = os.environ.get("OXAPAY_KEY", "MEXVK4")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 SESSIONS_DIR = "sessions"
 
-
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://sell-bot-vcxn.onrender.com")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://amit-test-777.loca.lt")
 PORT = int(os.environ.get("PORT", 8080))
 
 # --- DB SETUP ---
 MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://amitprojects545_db_user:XtPmY6eQTFcpHcaz@cluster0.0k08xds.mongodb.net/?appName=Cluster0")
-mongo_client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
+mongo_client = motor.motor_asyncio.AsyncIOMotorClient(
+    MONGO_URI,
+    tls=True,
+    tlsAllowInvalidCertificates=True,
+    serverSelectionTimeoutMS=30000,
+)
 db = mongo_client["vip_bot_db"]
 
 products_col = db["products"]
@@ -56,6 +59,26 @@ sessions_col = db["string_sessions"]
 if not os.path.exists(SESSIONS_DIR): os.makedirs(SESSIONS_DIR)
 
 # ==========================================
+# WORKER QUEUE FOR BULK MIRRORING
+# ==========================================
+# Create a global queue for mirroring tasks
+mirror_queue = asyncio.Queue()
+
+async def mirror_worker():
+    """Background worker that handles mirroring one by one to prevent crashes during bulk upload."""
+    logger.info("🚀 Mirror Worker started and waiting for tasks...")
+    while True:
+        task = await mirror_queue.get()
+        try:
+            admin_uid, ctype, fid, token, text, cat, wait_mid = task
+            logger.info(f"🔄 Worker processing mirror for: {str(fid)[:10]}...")
+            await mirror_content_background(admin_uid, ctype, fid, token, text, cat, wait_mid)
+        except Exception as e:
+            logger.error(f"❌ Worker Error: {e}")
+        finally:
+            mirror_queue.task_done()
+
+# ==========================================
 # CORE BOT HELPERS & INIT
 # ==========================================
 async def init_db():
@@ -66,26 +89,6 @@ async def init_db():
             await products_col.insert_many(default_categories)
     except Exception as e:
         logger.error(f"Error initializing DB: {e}\n{traceback.format_exc()}")
-# Create a global queue for mirroring tasks
-mirror_queue = asyncio.Queue()
-
-async def mirror_worker():
-    """Background worker that handles mirroring one by one to prevent crashes."""
-    logger.info("🚀 Mirror Worker started and waiting for tasks...")
-    while True:
-        # Get a 'task' from the queue
-        task = await mirror_queue.get()
-        try:
-            # Unpack task data
-            admin_uid, ctype, fid, token, text, cat, wait_mid = task
-            logger.info(f"🔄 Worker processing mirror for: {fid[:10]}...")
-            # Run the heavy mirroring logic
-            await mirror_content_background(admin_uid, ctype, fid, token, text, cat, wait_mid)
-        except Exception as e:
-            logger.error(f"❌ Worker Error: {e}")
-        finally:
-            # Tell the queue that the task is finished
-            mirror_queue.task_done()
 
 async def get_categories():
     try:
@@ -179,15 +182,10 @@ async def mirror_content_background(admin_uid, ctype, primary_file_id, primary_t
     settings = await settings_col.find_one({"_id": "global_settings"}) or {}
     backup_bots = settings.get("backup_bots", [])
     
-    content_doc = {
-        "category": cat, "type": ctype, "text": text_content, 
-        "primary_token": primary_token, "file_id": primary_file_id,
-        "mirrors": [{"token": primary_token, "file_id": primary_file_id}],
-        "added_at": datetime.now().isoformat()
-    }
+    # Check if content doc already exists to avoid double-saving in new queue logic
+    existing_doc = await content_col.find_one({"file_id": primary_file_id})
     
     if not backup_bots or ctype == "text":
-        await content_col.insert_one(content_doc)
         if wait_mid:
             await api_call("editMessageText", {"chat_id": admin_uid, "message_id": wait_mid, "text": f"✅ **Saved!** (No backup bots configured).", "parse_mode": "Markdown"}, token=primary_token)
         return
@@ -196,12 +194,16 @@ async def mirror_content_background(admin_uid, ctype, primary_file_id, primary_t
     if file_bytes:
         tasks = [_upload_to_backup_bot(bot["token"], admin_uid, cat, ctype, file_bytes) for bot in backup_bots if bot.get("token")]
         results = await asyncio.gather(*tasks)
+        
+        new_mirrors = []
         for r in results:
-            if r: content_doc["mirrors"].append(r)
+            if r: new_mirrors.append(r)
+            
+        if new_mirrors and existing_doc:
+            await content_col.update_one({"_id": existing_doc["_id"]}, {"$push": {"mirrors": {"$each": new_mirrors}}})
 
-    await content_col.insert_one(content_doc)
     if wait_mid:
-        await api_call("editMessageText", {"chat_id": admin_uid, "message_id": wait_mid, "text": f"✅ **Saved!** {ctype.capitalize()} safely mirrored to {len(content_doc['mirrors']) - 1} backup bots.", "parse_mode": "Markdown"}, token=primary_token)
+        await api_call("editMessageText", {"chat_id": admin_uid, "message_id": wait_mid, "text": f"✅ **Saved & Mirrored!**", "parse_mode": "Markdown"}, token=primary_token)
 
 async def send_content_to_group(group_id, content_doc):
     settings = await settings_col.find_one({"_id": "global_settings"}) or {}
@@ -460,7 +462,6 @@ async def process_update(update):
                             try:
                                 await client.connect()
                                 if await client.is_user_authorized():
-                                    # THE FIX: Safely convert SQLite to StringSession format
                                     string_session = StringSession.save(client.session)
                                     
                                     if string_session:
@@ -608,18 +609,18 @@ async def process_content_update(update, ctoken):
             if uid in admin_ids:
                 active_session = await bulk_sessions_col.find_one({"admin_id": uid, "active": True})
 
-                if text := msg.get("text", ""):
-                    if text.startswith("/bulkmodestart "):
-                        cat = text.split(" ")[1]
-                        await bulk_sessions_col.update_one({"admin_id": uid}, {"$set": {"category": cat, "active": True}}, upsert=True)
-                        await api_call("sendMessage", {"chat_id": uid, "text": f"🟢 **Bulk Mode Started: `{cat}`**\n\nForward media now. I will save them instantly and mirror in the background.", "parse_mode": "Markdown"}, token=ctoken)
-                        return
-                    elif text == "/bulkmodeend":
-                        await bulk_sessions_col.update_one({"admin_id": uid}, {"$set": {"active": False}})
-                        await api_call("sendMessage", {"chat_id": uid, "text": "🔴 Bulk Mode Ended.", "parse_mode": "Markdown"}, token=ctoken)
-                        return
+                text = msg.get("text", "")
+                if text.startswith("/bulkmodestart "):
+                    cat = text.split(" ")[1]
+                    await bulk_sessions_col.update_one({"admin_id": uid}, {"$set": {"category": cat, "active": True}}, upsert=True)
+                    await api_call("sendMessage", {"chat_id": uid, "text": f"🟢 **Bulk Mode Started: `{cat}`**\n\nForward media now. I will save them instantly and mirror in the background.", "parse_mode": "Markdown"}, token=ctoken)
+                    return
+                elif text == "/bulkmodeend":
+                    await bulk_sessions_col.update_one({"admin_id": uid}, {"$set": {"active": False}})
+                    await api_call("sendMessage", {"chat_id": uid, "text": "🔴 Bulk Mode Ended.", "parse_mode": "Markdown"}, token=ctoken)
+                    return
                     
-                if active_session and not msg.get("text", "").startswith("/"):
+                if active_session and not text.startswith("/"):
                     ctype = "text"
                     fid = None
                     text_content = msg.get("text") or msg.get("caption", "")
@@ -628,24 +629,18 @@ async def process_content_update(update, ctoken):
                     elif "video" in msg: ctype = "video"; fid = msg["video"]["file_id"]
                     elif "document" in msg: ctype = "document"; fid = msg["document"]["file_id"]
 
-                    # ⚡ STEP 1: INSTANT SAVE TO DB
-                    # We save immediately so Telegram gets a 200 OK response right away.
+                    # ⚡ INSTANT SAVE (Crucial for Bulk)
                     content_doc = {
-                        "category": active_session["category"], 
-                        "type": ctype, 
-                        "text": text_content, 
-                        "primary_token": ctoken, 
-                        "file_id": fid,
-                        "mirrors": [{"token": ctoken, "file_id": fid}],
+                        "category": active_session["category"], "type": ctype, "text": text_content, 
+                        "primary_token": ctoken, "file_id": fid, "mirrors": [{"token": ctoken, "file_id": fid}],
                         "added_at": datetime.now().isoformat()
                     }
-                    await content_col.insert_one(content_doc) #
+                    await content_col.insert_one(content_doc)
 
-                    # 🛠 STEP 2: ADD TO QUEUE
-                    # If it's media, put it in the queue for the background worker to mirror.
+                    # 🛠 QUEUE THE HEAVY MIRRORING
                     if fid:
                         await mirror_queue.put((uid, ctype, fid, ctoken, text_content, active_session["category"], None))
-                        
+
     except Exception as e: 
         logger.error(f"Fast Save Error: {e}")
 
@@ -684,9 +679,10 @@ async def handle_oxapay_webhook(request):
 
 async def start_background_tasks(app):
     await init_db()
-    asyncio.create_task(mirror_worker()) #
     
-    settings = await settings_col.find_one({"_id": "global_settings"}) or {}
+    # --- START THE MIRROR WORKER ---
+    asyncio.create_task(mirror_worker())
+    
     settings = await settings_col.find_one({"_id": "global_settings"}) or {}
     m_token = settings.get("bot_token", BOT_TOKEN).strip()
     p_token = settings.get("payment_bot_token", "").strip()
