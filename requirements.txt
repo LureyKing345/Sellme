@@ -4,3 +4,4 @@ dnspython
 telethon
 cryptography
 certifi
+pymongo
